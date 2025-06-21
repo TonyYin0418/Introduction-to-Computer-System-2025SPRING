@@ -54,7 +54,7 @@ gcc main.o sum.o -o prog
 目标文件的主要形式包括：
 
 - `.o` 文件：可重定位目标文件。
-- `.out` 文件：通常用于早期的可执行文件格式。
+- 可执行文件：历史上曾经要求后缀名为 `.out`，但可以无后缀，后缀名不重要。
 - `.so` 文件：共享对象文件，用于动态链接库。
 
 ## Executable and Linkable Format (ELF)
@@ -145,8 +145,6 @@ gcc 对于一些特殊类型的变量，会存储到特殊段：
 - `COMMON`：未初始化的全局变量。
 - `.bss`：未初始化的静态变量，初始化为 0 的全局或静态变量。
 
-
-
 **「Local Symbols」** 编译器确保局部符号的唯一性。因此无需Linker 特别协调，只需要存储局部符号的地址即可。
 
 **「Global Symbols」** 对于全局符号，每遇到一个弱全局符号，编译器不能确定用哪个定义，就先认为这个符号会出现在其他模块中，具体地：
@@ -234,103 +232,96 @@ void f() {
 
 重定位条目是一个个结构体，存储在 `.rel` 节中，包含以下信息：
 
-- **「Offset 偏移量」** 指明需要修改的节的偏移量。
+- **「Offset 偏移量」** 指明需要修改的位置（比如指令中的立即数或地址）在它所属节中的偏移量。
 - **「Symbol Index 符号索引」** 指明需要重定位的符号在符号表中的索引。
 - **「Type 类型」** 指明重定位的类型，分为绝对地址类型 R_X86_64_32、相对地址类型 R_X86_64_PC32 等。
 - **「Addend 加数」** 指明需要加上的值，帮助链接器精确计算最终填充值。
 
 具体可以在后面的例子中理解，先明确一下这两种重定位类型的区别。
 
-- **「R_X86_64_PC32」** 相对寻址，需要计算得到绝对地址。
-- **「R_X86_64_32」** 绝对寻址，直接存有效地址。
+- **「R_X86_64_PC32」** 相对寻址，需要填充的值是 **目标符号的运行时地址加上 Addend**，再减去 **重定位发生后程序计数器 PC 的值**。
+- **「R_X86_64_32」** 绝对寻址，需要填充的值是 **目标符号的运行时绝对地址** 加上 Addend。
 
 用下面的例子来进一步解释：
 
 ```c
-// main.c
-int sum(int* a, int n);
-int array[2] = {1,2};
-int main()
+/* main.c */
+int sum(int *a, int n);
+int array[2] = {1, 2};
+int main() 
 {
     int val = sum(array, 2);
     return val;
 }
 
 // sum.c
-int sum(int* a, int n) {
-    int s = 0;
-    for(int i = 0 ; i < n ; i ++)
+int sum(int *a, int n)
+{
+    int i, s = 0;    
+    for (i = 0; i < n; i++) { 
         s += a[i];
+    }
     return s;
-}
+}        
 ```
 
 ```asm
 0000000000000000 <main>:
-   0:   55                      push   %rbp
-   1:   48 89 e5                mov    %rsp,%rbp
-   4:   48 83 ec 10             sub    $0x10,%rsp
-   8:   be 02 00 00 00          mov    $0x2,%esi
-   d:   bf 00 00 00 00          mov    $0x0,%edi
-  12:   e8 00 00 00 00          callq  17 <main+0x17>
-  17:   89 45 fc                mov    %eax,-0x4(%rbp)
-  1a:   8b 45 fc                mov    -0x4(%rbp),%eax
-  1d:   c9                      leaveq 
-  1e:   c3                      retq
+   0:	48 83 ec 08          	sub    $0x8,%rsp
+   4:	be 02 00 00 00       	mov    $0x2,%esi
+   9:	bf 00 00 00 00       	mov    $0x0,%edi
+			a: R_X86_64_32	array
+   e:	e8 00 00 00 00       	callq  13 <main+0x13>
+			f: R_X86_64_PC32	sum-0x4
+  13:	48 83 c4 08          	add    $0x8,%rsp
+  17:	c3                   	retq   
 ```
+
+假设 Linker 在合并完所有目标文件后，确定了以下运行时地址：
+
+- `main` 函数（`.text` 节起始）的地址为 `0x4004d0`。
+- `sum` 函数的地址为 `0x4004e8`。
+- `array` 变量（在 `.data` 或 `.bss` 节）的地址为 `0x601020`。
 
 ### PC 相对引用的计算方法
 
-在这个例子中，`main`函数是一个 Section，其中调用 `sum` 指令的地址是 `0x12`，`e8`是操作码，后面的`00`为预留给 Linker 的引用地址。
+`main` 函数中调用 `sum` 函数的指令 `callq 17 <main+0x17>` 实际上是 `e8` 后面跟一个 32 位的相对偏移量。这条指令从 `main` 节的偏移量 `0x12` 开始，相对偏移量本身存储在偏移量 `0x13` 到 `0x16` 的 4 个字节中（当前值是 `00 00 00 00`）。
 
-相应的重定位条目：
+相应的重定位条目会指向这个位置：
 
 ```asm
 r.offset = 0xf
 r.symbol = sum
 r.type   = R_X86_64_PC32
 r.addend = -4
+# 下面会请关注 `offset` 和 `addend` 字段的用途。
 ```
 
-下面会着重解释 `offset` 和 `addend` 字段的用途。
+**「Offset」** 字段的作用就是告诉 Linker 需要修改的值的位置，记为 $\mathtt{refaddr}$，计算方法为：
+$$
+\mathtt{refaddr}=\text{ADDR(r.main)}+\text{r.offset}
+$$
+代入具体数值计算：
+$$
+\mathtt{refaddr}=\mathtt{0x4004}+\mathtt{0xf}=\mathtt{0x4004df}
+$$
+ **「Addend」** 字段就是为了让 Linker 计算出需要填充到 $\mathtt{refaddr}$ 位置的值，记为 $\mathtt{*refptr}$，计算方法为：
+$$
+\mathtt{*refptr} = \text{ADDR(r.symbol)} + \text{r.addend} - \text{r.refaddr}
+$$
+代入具体数值计算：
 
-假设目前已知 `main` 函数地址 $\text{ADDR(main)}=\mathtt{0x4004d0}$，`sum` 函数地址：$\text{ADDR(sum)}=\mathtt{0x4004e8}$.
+$$
+\mathtt{*refptr}=\mathtt{0x4004e8}-4-\mathtt{0x4004df}=\mathtt{0x5}
+$$
 
-接下来分为两步：
+Linker 会将 `0x5` 这个值填充到 `0x4004d0 + 0xf` 的位置。
 
-- 首先要找到 $\mathtt{refaddr}$，也就是引用的运行时地址，在这例子中就是被 call 的函数的地址的位置，也就是 `e8` 后面的 `00` 的地址：
-  $$
-  \  \mathtt{refaddr} = \mathtt{0x4004d0} + 0xf = \mathtt{0x4004df}
-  $$
-  算出来刚好就是 $\mathtt{0x4004de}$ 的后一位。
+当 CPU 执行到 `callq` 指令时，它会计算当前 PC 值 (`0x4004e3`) 加上操作数 (`0x5`)，得到 `0x4004e8`，从而实现正确的函数调用跳转。
 
-  于是可以理解 **「Offset」** 字段的作用就是告诉 Linker 需要修改的地址（位置）。
+PC 寄存器会存储下一条指令 `13: add $0x8,%rsp` 的地址。$\text{PC}=\mathtt{0x4004d0+0x13=0x4004e3}$.
 
-
-- 之后要计算出 `sum` 函数的地址，要填充到上面位置中的 `00` 中。
-
-    > 这里要明确一下 PC 寄存器的作用。PC 寄存器默认存储的是下一条指令的地址。在 Linker 修改前，正在运行 `call` 指令时，PC 寄存器存储的值为下面 `add` 指令的地址，即 $\mathtt{0x4004d0}+0x13=\mathtt{0x4e0043}$.
-    >
-    > 在 `call` 指令执行完后，CPU会让 $\text{PC}\leftarrow \text{PC}+\text{r.addend}$，然后跳转到 $\text{PC}$ 这条指令。
-
-    设要填充进去的数叫做 `*refptr`。我们想要的结果是：执行完 `callq` 之后，PC 的值为 `sum` 函数的第一条指令地址 $\mathtt{0x4004e8}$。因此 `*refptr` 满足：
-    $$
-    \text{ADDR(r.symbol)}=\text{PC}+\text{refptr}
-    $$
-    而 `r.addend` 就是为了让 Linker 计算出 *`refptr` 的值。
-    
-    具体来讲，Linker 并不知道 PC 的值未知，所以才需要编译器提供这个 r.addend 辅助。
-    
-    我们只知道在其前面一点点的 $\text{refaddr}$，假设这里 `r.addend`就是在表达这个偏移量。那么就可以计算出 `*refptr` 的值了：
-    $$
-      \begin{aligned}
-      \mathtt{*refptr} &= \text{ADDR(r.symbol)}-\text{refaddr}+\text{r.addend}\\
-      &= \mathtt{0x4004e8}-\mathtt{0x4004df}+4\\
-      &= \mathtt{0x5}
-      \end{aligned}
-    $$
-    用手算的 PC 的值验证一下，$\mathtt{0x4004e3}+\mathtt{0x5}=\mathtt{0x4004e8}$。
-    
+Linker 并不知道 PC，所以才需要编译器提供这个 r.addend 辅助。
 
 ### 绝对引用
 
